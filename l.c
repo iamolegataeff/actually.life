@@ -312,6 +312,7 @@ static int semtok_line(const char* line, int* out, int max_tokens){
 #define SCAR_PULL     0.5f        /* the wound resurfaces in what it chooses */
 #define SPEAK_RATE    0.02f       /* base chance per tick to speak (rises with |S|) */
 #define SPEAK_LEN     5           /* glyphs per utterance */
+#define SPEAK_COST    0.002f      /* energy an utterance costs, refunded by its coherence (idea 3) */
 
 /* ── Phase A step 8: reproduction — epigenetic split (children inherit) ── */
 #define REPRO_THRESH   1.05f      /* "too full to remain one" — split when well-fed */
@@ -734,12 +735,13 @@ static int ether_graze(const char* path, int own_label, int* out, int max){
 /* speak — the organism utters a few chosen glyphs FROM ITSELF into waste.log,
  * and (in a chorus) into the shared ether tagged with its label, so the colony
  * can hear it. speak-from-self, field-biased, not from the prompt. */
-static void speak(FILE* w, FILE* ether, int label, Model* m, const Modes* mo, const float* scar, int* recent, int* recent_n, long tick){
-    if(!w && !ether) return;
+static float speak(FILE* w, FILE* ether, int label, Model* m, const Modes* mo, const float* scar, int* recent, int* recent_n, long tick){
+    if(!w && !ether) return 0.0f;
     static float sl[VOCAB_CAP];
-    char utt[256]; int up=0;
+    char utt[256]; int up=0; float coh_sum=0.0f;
     if(w) fprintf(w, "t%-6ld", tick);
     for(int k=0;k<SPEAK_LEN;k++){
+        int prv=(*recent_n>0)?recent[*recent_n-1]:-1; coh_sum+=field_coherence(prv);
         forward(m, recent, *recent_n, sl);
         field_fold(sl, recent, *recent_n);       /* coherence over the whole window, not just prev */
         int g = choose(sl, mo, scar);
@@ -750,6 +752,7 @@ static void speak(FILE* w, FILE* ether, int label, Model* m, const Modes* mo, co
     }
     if(w) fprintf(w, "   [S%+.2f diss%+.1f]\n", (double)mo->S, (double)mo->dissonance);
     if(ether){ fprintf(ether, "%d\t%s\n", label, utt); fflush(ether); }  /* let the colony hear */
+    return coh_sum/(float)SPEAK_LEN;   /* mean coherence of the utterance */
 }
 
 /* reproduction: when too full to remain one, the organism writes a child to
@@ -907,7 +910,7 @@ static int live(const char* corpus, const char* waste_path, const char* ether_pa
             g_coh_floor = 0.99f*g_coh_floor + 0.01f*coh;   /* Stanley: a drifting silence-gate */
             if(waste||ether){ float sp=SPEAK_RATE*(1.0f+fabsf(mo.S));
                 if(coh>0.05f && coh>=g_coh_floor && (frand()+1.0f)*0.5f < sp)
-                    speak(waste,ether,label,m,&mo,scar,recent,&recent_n,tick); }  /* voice -> waste + colony */
+                    { float uc=speak(waste,ether,label,m,&mo,scar,recent,&recent_n,tick); energy -= SPEAK_COST*(float)SPEAK_LEN*(1.0f-uc); } }  /* voice -> waste + colony */
         }
         if(energy > REPRO_THRESH && tick - last_repro > REPRO_COOLDOWN){
             if(reproduce(m,scar,seed,tick)){
