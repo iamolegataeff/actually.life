@@ -19,6 +19,8 @@
 #include <string.h>
 #include <math.h>
 #include <sys/stat.h>
+#include <unistd.h>      /* fork — the chorus is a colony of processes */
+#include <sys/wait.h>
 /* ── semantic membrane (inlined) — English → 88 cave-glyphs ──────────────
  * one source of truth for eat / train / speak. word -> concept compression,
  * BE = super-glyph copula. function words die at the door. (from caveLLMan.) */
@@ -187,22 +189,78 @@ static int semtok_word(const char* word){
             return semtok_find_glyph(SEM_WORD_MAP[i].glyph);
     return -1;
 }
+
+/* ── THE MOUTH — no word is inedible ──────────────────────────────────────
+ * the ancestor's semtok DROPS every unmapped word (caveLLMan does the same):
+ * feed it alien text and it starves with a full plate — a mouth that can only
+ * bite ~400 words is not a mouth. the fix: every non-stop word routes to a
+ * glyph by ORTHOGRAPHIC RESONANCE, not a blind hash. at birth each mapped word
+ * votes its glyph into its character trigrams, so an unknown word ("inferno")
+ * lands on the glyph of the known words it resembles ("fire","flame","burn").
+ * a truly alien word (no known trigrams) falls back to a deterministic FNV
+ * glyph — still edible, never dropped. the map is the seed; resemblance is the
+ * generalization. survival stops depending on the specific corpus. */
+#define GRAM_BUCKETS 4096
+static signed char g_gram2glyph[GRAM_BUCKETS];   /* trigram-hash -> dominant glyph; -1 = empty */
+static int g_mouth_ready = 0;
+
+static unsigned gram_hash(unsigned char a, unsigned char b, unsigned char c){
+    return (((unsigned)a*131u + b)*131u + c) & (GRAM_BUCKETS-1);
+}
+static void mouth_vote(int (*vote)[GLYPH_COUNT], const char* w, int g){
+    int L=(int)strlen(w);
+    for(int i=0;i+3<=L;i++)
+        vote[gram_hash((unsigned char)w[i],(unsigned char)w[i+1],(unsigned char)w[i+2])][g]++;
+}
+/* build the router from SEM_WORD_MAP + the 88 base names — once, at birth */
+static void mouth_build(void){
+    int (*vote)[GLYPH_COUNT] = calloc(GRAM_BUCKETS, sizeof(*vote));
+    if(!vote){ g_mouth_ready=0; return; }
+    for(int i=0;i<GLYPH_COUNT;i++) mouth_vote(vote, GLYPH_NAMES[i], i);
+    for(int i=0; SEM_WORD_MAP[i].word; i++){
+        int g=semtok_find_glyph(SEM_WORD_MAP[i].glyph);
+        if(g>=0) mouth_vote(vote, SEM_WORD_MAP[i].word, g);
+    }
+    for(int b=0;b<GRAM_BUCKETS;b++){
+        int best=-1, bestv=0;
+        for(int g=0; g<GLYPH_COUNT; g++) if(vote[b][g]>bestv){ bestv=vote[b][g]; best=g; }
+        g_gram2glyph[b]=(signed char)best;
+    }
+    free(vote); g_mouth_ready=1;
+}
+/* any word -> a glyph, NEVER -1. resemblance first, FNV fallback for the alien. */
+static int semtok_word_soft(const char* w){
+    int hist[GLYPH_COUNT]; for(int i=0;i<GLYPH_COUNT;i++) hist[i]=0;
+    int L=(int)strlen(w), votes=0;
+    if(g_mouth_ready) for(int i=0;i+3<=L;i++){
+        int g=g_gram2glyph[gram_hash((unsigned char)w[i],(unsigned char)w[i+1],(unsigned char)w[i+2])];
+        if(g>=0){ hist[g]++; votes++; }
+    }
+    if(votes>0){ int best=0; for(int g=1;g<GLYPH_COUNT;g++) if(hist[g]>hist[best]) best=g; return best; }
+    unsigned h=2166136261u; for(int i=0;i<L;i++) h=(h^(unsigned char)w[i])*16777619u;  /* fnv-1a */
+    return (int)(h % (unsigned)GLYPH_COUNT);
+}
+
 /* a line of English -> glyph ids; lowercases, strips punctuation, drops stop
- * words and unmapped words, suppresses consecutive dups. returns count. */
+ * words, ROUTES every other word through the mouth (never drops), suppresses
+ * consecutive dups. a line of only stop-words still feeds one glyph. */
 static int semtok_line(const char* line, int* out, int max_tokens){
     char buf[4096];
     strncpy(buf,line,4095); buf[4095]='\0';
     for(int i=0;buf[i];i++) if(buf[i]>='A'&&buf[i]<='Z') buf[i]+=32;
     for(int i=0;buf[i];i++){ unsigned char c=(unsigned char)buf[i];
         if(!((c>='a'&&c<='z')||(c>='0'&&c<='9')||c==' '||c=='\''||c=='-')) buf[i]=' '; }
-    int n=0, last_id=-1;
+    int n=0, last_id=-1, any_tok=0;
     char* tok=strtok(buf," \t\n");
     while(tok && n<max_tokens){
+        any_tok=1;
         if(*tok=='\0'||semtok_is_stop_word(tok)){ tok=strtok(NULL," \t\n"); continue; }
         int id=semtok_word(tok);
+        if(id<0) id=semtok_word_soft(tok);          /* THE MOUTH: no word is dropped */
         if(id>=0 && id!=last_id){ out[n++]=id; last_id=id; }
         tok=strtok(NULL," \t\n");
     }
+    if(n==0 && any_tok && max_tokens>0){ out[0]=semtok_word_soft(line); n=1; } /* only-stop-words still a meal */
     return n;
 }
 
@@ -218,15 +276,18 @@ static int semtok_line_shout(const char* line, int* out, int* shout, int max_tok
     for(int i=0;buf[i];i++) if(buf[i]>='A'&&buf[i]<='Z') buf[i]+=32;   /* sees caps -> lowercases them */
     for(int i=0;buf[i];i++){ unsigned char c=(unsigned char)buf[i];
         if(!((c>='a'&&c<='z')||(c>='0'&&c<='9')||c==' '||c=='\''||c=='-')) buf[i]=' '; }
-    int n=0, last_id=-1;
+    int n=0, last_id=-1, any_tok=0;
     char* tok=strtok(buf," \t\n");
     while(tok && n<max_tokens){
+        any_tok=1;
         if(*tok!='\0' && !semtok_is_stop_word(tok)){
             int id=semtok_word(tok);
+            if(id<0) id=semtok_word_soft(tok);      /* THE MOUTH: no word is dropped */
             if(id>=0 && id!=last_id){ out[n]=id; if(shout) shout[n]=0; n++; last_id=id; }
         }
         tok=strtok(NULL," \t\n");
     }
+    if(n==0 && any_tok && max_tokens>0){ out[0]=semtok_word_soft(line); if(shout) shout[0]=0; n=1; }
     return n;
 }
 
@@ -555,12 +616,55 @@ static const char* glyph_name(int id){
 
 /* ── main — Phase A step 3a: the breathing clock with a second signal ──
  * usage: ./nanolife [seed] [diet-glyph]
- *   no diet  -> eats lifeisshit/world.txt line by line, then starves.
+ *   no diet  -> eats lifeis/world.txt line by line, then starves.
  *   diet     -> an infinite mono-glyph diet (e.g. fire / food) for A/B: does
  *               the charge bend life differently at the SAME weights? */
 static void recent_push(int* recent, int* rn, int g){  /* ring of last glyphs — the dream's context */
     if(*rn < CTX) recent[(*rn)++]=g;
     else { memmove(recent, recent+1, (CTX-1)*sizeof(int)); recent[CTX-1]=g; }
+}
+
+/* ── THE FIELD — coherence without training (SPA / Q metaweights, glyph-level) ──
+ * the transformer weights are random and frozen: their logits are noise, so
+ * speak-from-self comes out a glyph salad. postgpt's thesis: the coherence a
+ * model seems to LEARN is largely latent in the token stream itself — a bigram
+ * field IS a model that was never trained. so the organism builds a glyph
+ * bigram field ONLINE from what it eats, and folds it into its own logits:
+ *   final = gate*transformer + (1-gate)*field,   gate = Q's earned-voice clamp.
+ * random weights -> avg|logit|~0.1 -> gate~0 -> the FIELD speaks. were the weights
+ * ever trained, gate would rise and the transformer would take the voice back.
+ * no backprop, no target: coherence is a property of the sampling field. */
+static float g_field_bi[VOCAB_CAP][VOCAB_CAP];   /* online glyph bigram counts a->b */
+static float g_field_row[VOCAB_CAP];             /* row sums, for normalization */
+static float g_coh_floor = 0.0f;                 /* drifting silence-gate (Stanley) */
+static int   g_field_on  = 1;                    /* NL_NOFIELD=1 lifts the field (A/B) */
+
+/* observe the eaten glyph stream — the field grows as the organism lives */
+static void field_observe(const int* g, int n){
+    if(!g_field_on) return;
+    for(int i=0;i+1<n;i++){
+        int a=g[i], b=g[i+1];
+        if(a<0||a>=VOCAB_CAP||b<0||b>=VOCAB_CAP) continue;
+        g_field_bi[a][b]+=1.0f; g_field_row[a]+=1.0f;
+    }
+}
+/* how confident is the field about what follows `prev` (0=flat, 1=certain) */
+static float field_coherence(int prev){
+    if(prev<0||prev>=VOCAB_CAP||g_field_row[prev]<=0.0f) return 0.0f;
+    float mx=0.0f, inv=1.0f/g_field_row[prev];
+    for(int b=0;b<VOCAB_CAP;b++){ float p=g_field_bi[prev][b]*inv; if(p>mx) mx=p; }
+    return mx;
+}
+/* fold the field into the transformer's logits in place, Q-gated by earned voice */
+static void field_fold(float* logits, int prev){
+    if(!g_field_on || prev<0 || prev>=VOCAB_CAP || g_field_row[prev]<=0.0f) return;
+    float mag=0.0f; for(int i=0;i<VOCAB_CAP;i++) mag+=fabsf(logits[i]); mag/=VOCAB_CAP;
+    float gate=(mag-0.5f)/1.5f; if(gate<0.0f)gate=0.0f; if(gate>1.0f)gate=1.0f; /* Q: earned voice */
+    float inv=1.0f-gate, rowinv=1.0f/g_field_row[prev];
+    for(int b=0;b<VOCAB_CAP;b++){
+        float p=g_field_bi[prev][b]*rowinv;
+        logits[b]=gate*logits[b] + inv*logf(p+1e-6f);   /* untrained -> field log-probs rule */
+    }
 }
 
 /* choose — the organism picks ONE glyph from the fork. NOT argmax: a seeded,
@@ -588,21 +692,48 @@ static int choose(const float* logits, const Modes* mo, const float* scar){
 }
 /* speak — the organism utters a few chosen glyphs FROM ITSELF (speak-from-self,
  * not from the prompt) into waste.log. its own words become its next context. */
-static void speak(FILE* w, Model* m, const Modes* mo, const float* scar, int* recent, int* recent_n, long tick){
-    if(!w) return;
+/* ── THE ETHER — one cell's voice becomes another's food ─────────────────────
+ * eat the chorus: read the most recent utterance from ANOTHER cell out of the
+ * shared ether and tokenize its glyph-names back to ids (they ARE GLYPH_NAMES,
+ * so semtok maps them directly). this is the cross-graze — resonance made of
+ * appetite. line format: "<label>\t<glyph names>". own echoes are skipped. */
+static int ether_graze(const char* path, int own_label, int* out, int max){
+    FILE* f=fopen(path,"r"); if(!f) return 0;
+    char buf[256], last[256]; last[0]='\0';
+    while(fgets(buf,sizeof buf,f)){
+        if(atoi(buf)==own_label) continue;             /* don't eat your own echo */
+        char* tab=strchr(buf,'\t'); if(!tab) continue;
+        strncpy(last,tab+1,255); last[255]='\0';       /* remember the newest not-own voice */
+    }
+    fclose(f);
+    if(!last[0]) return 0;
+    return semtok_line(last, out, max);
+}
+
+/* speak — the organism utters a few chosen glyphs FROM ITSELF into waste.log,
+ * and (in a chorus) into the shared ether tagged with its label, so the colony
+ * can hear it. speak-from-self, field-biased, not from the prompt. */
+static void speak(FILE* w, FILE* ether, int label, Model* m, const Modes* mo, const float* scar, int* recent, int* recent_n, long tick){
+    if(!w && !ether) return;
     static float sl[VOCAB_CAP];
-    fprintf(w, "t%-6ld", tick);
+    char utt[256]; int up=0; utt[0]='\0';
+    if(w) fprintf(w, "t%-6ld", tick);
     for(int k=0;k<SPEAK_LEN;k++){
+        int prev = (*recent_n>0) ? recent[*recent_n-1] : -1;
         forward(m, recent, *recent_n, sl);
+        field_fold(sl, prev);                    /* coherence: bias toward what really follows */
         int g = choose(sl, mo, scar);
-        fprintf(w, " %s", glyph_name(g));
+        const char* gn = glyph_name(g);
+        if(w) fprintf(w, " %s", gn);
+        if(up < (int)sizeof(utt)-16) up += snprintf(utt+up, sizeof(utt)-up, "%s%s", up?" ":"", gn);
         recent_push(recent, recent_n, g);
     }
-    fprintf(w, "   [S%+.2f diss%+.1f]\n", (double)mo->S, (double)mo->dissonance);
+    if(w) fprintf(w, "   [S%+.2f diss%+.1f]\n", (double)mo->S, (double)mo->dissonance);
+    if(ether){ fprintf(ether, "%d\t%s\n", label, utt); fflush(ether); }  /* let the colony hear */
 }
 
 /* reproduction: when too full to remain one, the organism writes a child to
- * lifeisshit/children/ — inheriting its scars, a derived seed (hash of parent
+ * lifeis/children/ — inheriting its scars, a derived seed (hash of parent
  * seed ^ tick), its invented symbols, and a warm-start of its genome. asexual,
  * epigenetic; the child re-trains on its own slice later (the trainer). */
 static int g_n_children = 0;
@@ -613,8 +744,8 @@ static unsigned long hash_seed(unsigned long s, long tick){
 }
 static int reproduce(const Model* m, const float* scar, unsigned long pseed, long tick){
     if(g_n_children >= MAX_CHILDREN) return 0;
-    mkdir("lifeisshit", 0755); mkdir("lifeisshit/children", 0755);
-    char path[256]; snprintf(path,sizeof path,"lifeisshit/children/child_%d.nl", g_n_children);
+    mkdir("lifeis", 0755); mkdir("lifeis/children", 0755);
+    char path[256]; snprintf(path,sizeof path,"lifeis/children/child_%d.nl", g_n_children);
     FILE* f=fopen(path,"wb"); if(!f) return 0;
     unsigned long cseed = hash_seed(pseed, tick);
     int ok = 1;
@@ -670,103 +801,205 @@ static void run_mouth(Model* m, unsigned long seed){
     else                       printf("  ...you fell silent. it waits in the dark. (eof)\n");
 }
 
-int main(int argc, char** argv){
-    int mouth = (argc>1 && strcmp(argv[1],"--mouth")==0);
-    unsigned long seed = mouth ? (argc>2 ? strtoul(argv[2],NULL,10) : 42UL)
-                               : (argc>1 ? strtoul(argv[1],NULL,10) : 42UL);
+#define CHORUS_COHORT 4       /* the birth cohort — voices at t0 */
+#define MAX_CELLS     8       /* carrying capacity — the ceiling, not a roster (death frees slots) */
+
+/* ── live — one organism, birth to death ─────────────────────────────────────
+ * the single-cell life, extracted so a chorus can fork many of them. corpus is
+ * its food, waste its voice, seed its body AND its dice, label>=0 tags its prints
+ * when the colony forks (stdout interleaves). every per-cell global (field, scars,
+ * cooc, emerged symbols) is per-PROCESS — so fork gives each cell its own for free. */
+static int live(const char* corpus, const char* waste_path, const char* ether_path, const char* diet, unsigned long seed, int label){
+    char tag[24]; if(label>=0) snprintf(tag,sizeof tag,"[cell %d] ",label); else tag[0]='\0';
     seed_rng(seed);
-    charges_init();
-    Model* m=model_new();
-    if(mouth){ run_mouth(m,seed); free(m); return 0; }
+    Model* m=model_new();                          /* own seed -> own random body */
+    FILE* ether = ether_path ? fopen(ether_path,"a") : NULL;   /* the shared voice of the colony */
     long params=(long)(sizeof(Model)/sizeof(float));
-    /* optional diet: space-separated glyph words, e.g. "fire", "BE fire", or "FIRE" (shouted) */
+
     int diet_glyphs[CTX]; int diet_shout[CTX]; int diet_n=0;
-    if(argc>2) diet_n = semtok_line_shout(argv[2], diet_glyphs, diet_shout, CTX);
+    if(diet) diet_n = semtok_line_shout(diet, diet_glyphs, diet_shout, CTX);
     int diet_mode = diet_n>0;
 
-    printf("nanolife — a mortal clock that can eat.  seed=%lu  diet=%s\n",
-           seed, (diet_mode? argv[2] : "world"));
-    printf("  params=%ld  vocab=%d  E=%d L=%d H=%d ctx=%d  yield=%.1f rent=%.4f\n",
-           params,VOCAB,E,NL,NH,CTX,(double)DIGEST_YIELD,(double)RENT);
+    printf("%snanolife — a mortal clock that can eat.  seed=%lu  diet=%s  params=%ld\n",
+           tag, seed, (diet_mode? diet : (corpus?corpus:"world")), params);
 
-    /* birth: one perception of the world through the membrane */
-    { int t[CTX]; int bn=semtok_line("the sun is fire and i feel fear in the dark",t,CTX);
-      if(bn<1){ t[0]=BOS_ID; bn=1; }
-      printf("  first breath:"); for(int i=0;i<bn;i++) printf(" %s",glyph_name(t[i])); printf("\n\n"); }
+    FILE* food = diet_mode ? NULL : (corpus? fopen(corpus,"r") : NULL);
+    if(!diet_mode && !food && !ether){ printf("%s  no world to eat. да будет так.\n", tag); free(m); if(ether) fclose(ether); return 1; }
+    if(!food && ether) printf("%s  born into the chorus — no slice, feeds on the colony's voice.\n", tag);
+    FILE* waste = waste_path ? fopen(waste_path,"w") : NULL;
 
-    FILE* food = diet_mode ? NULL : fopen("lifeisshit/world.txt","r");
-    if(!diet_mode && !food){ printf("  no world to eat (lifeisshit/world.txt). да будет так.\n"); free(m); return 1; }
-    FILE* waste = fopen("lifeisshit/waste.log","w");   /* the organism's voice — output with consequences */
-
-    /* rent gnaws every tick; a glyph that MOVES the V-adapters (|ΔB_v|), scaled
-     * by its metab_factor (fire burns, food feeds), postpones death. one scalar
-     * carries metabolism and death; modes (S, dissonance) ride the second signal. */
     Modes mo = {0.0f, 0.0f};
     static float scar[VOCAB_CAP]; for(int i=0;i<VOCAB_CAP;i++) scar[i]=0.0f; /* permanent wounds (never decay) */
-    int   scar_on = (getenv("NL_NOSCAR")==NULL);  /* A/B toggle: NL_NOSCAR=1 lifts the wound's weight */
-    int   dream_on = (getenv("NL_NODREAM")==NULL);/* A/B toggle: NL_NODREAM=1 forbids self-feeding */
+    int   scar_on = (getenv("NL_NOSCAR")==NULL);
+    int   dream_on = (getenv("NL_NODREAM")==NULL);
     float scar_total=0.0f;
-    int   recent[CTX]; int recent_n=0;            /* ring of last glyphs — the dream's context */
+    int   recent[CTX]; int recent_n=0;
     long  dream_streak=0;
     long  last_repro=-REPRO_COOLDOWN;
-    int   homeo_on=(getenv("NL_NOHOMEO")==NULL);  /* A/B toggle: NL_NOHOMEO=1 lets passion run away */
+    int   homeo_on=(getenv("NL_NOHOMEO")==NULL);
     int   contour_died=0;
+    long  n_graze=0, n_dream=0;                    /* resonance/self-feed counters */
     float energy=E_BORN;
     long  tick=0;
     char  line[4096];
     int   glyphs[CTX]; int shout[CTX];
-    int   fed=1;
+    int   fed=(food?1:0);                           /* ether-born cells start hungry, on the chorus */
     while(energy>0.0f && tick<200000){          /* cap = falsification guard: it MUST die */
         tick++;
-        energy -= RENT * (1.0f + (scar_on? SCAR_RENT*scar_total : 0.0f)); /* wounds make rent heavier */
+        energy -= RENT * (1.0f + (scar_on? SCAR_RENT*scar_total : 0.0f));
         float yield=0.0f;
-        int   dreaming=0;
+        int   dreaming=0, grazing=0;
         if(diet_mode){
             yield=digest(m,&mo,scar,diet_glyphs,diet_shout,diet_n);
             for(int i=0;i<diet_n;i++) recent_push(recent,&recent_n,diet_glyphs[i]);
-            cooc_track(diet_glyphs,diet_n); dream_streak=0;
-        } else if(fed && fgets(line,sizeof(line),food)){
+            cooc_track(diet_glyphs,diet_n); field_observe(diet_glyphs,diet_n); dream_streak=0;
+        } else if(fed && food && fgets(line,sizeof(line),food)){
             int n=semtok_line_shout(line,glyphs,shout,CTX);
             if(n>=1){ yield=digest(m,&mo,scar,glyphs,shout,n);
                 for(int i=0;i<n;i++) recent_push(recent,&recent_n,glyphs[i]);
-                cooc_track(glyphs,n); dream_streak=0; }
-        } else {                                 /* corpus exhausted -> starvation, or dream */
+                cooc_track(glyphs,n); field_observe(glyphs,n); dream_streak=0; }
+        } else {                                 /* corpus exhausted -> eat the chorus, then dream */
             fed=0;
-            if(dream_on && energy<DREAM_THRESH && recent_n>0){  /* eat your own predicted glyph */
+            int gz[CTX], gn=0;
+            if(ether) gn=ether_graze(ether_path, label, gz, CTX);  /* FIRST: eat a neighbour's voice */
+            if(gn>=1){                               /* the colony feeds itself through speech */
+                yield=digest(m,&mo,scar,gz,NULL,gn);
+                for(int i=0;i<gn;i++) recent_push(recent,&recent_n,gz[i]);
+                cooc_track(gz,gn); field_observe(gz,gn); dream_streak=0; grazing=1; n_graze++;
+            } else if(dream_on && energy<DREAM_THRESH && recent_n>0){  /* ELSE: eat your own predicted glyph */
                 static float dl[VOCAB_CAP]; forward(m,recent,recent_n,dl);
+                field_fold(dl, recent[recent_n-1]);  /* dream coherently — replay the field, not noise */
                 int dg=choose(dl,&mo,scar);          /* the dream is chosen, not computed */
                 float dy=digest(m,&mo,scar,&dg,NULL,1);   /* a dream is not a shout */
                 yield = dy * DREAM_FRAC * expf(-(float)dream_streak/DREAM_DECAY); /* dreams thin out */
                 recent_push(recent,&recent_n,dg);
-                dream_streak++; dreaming=1;
+                dream_streak++; dreaming=1; n_dream++;
                 try_emerge(m);                   /* symbols are born only here, in dream */
             }
         }
         energy += DIGEST_YIELD*yield;
         scar_total=0.0f; for(int i=0;i<VOCAB_CAP;i++) scar_total+=scar[i];
-        if(homeo_on){ mo.dissonance *= DISS_DECAY; mo.S -= S_RELAX*mo.S; }  /* regulate toward viability */
-        if(fabsf(mo.S) >= S_DEATH){ contour_died=1; break; }               /* overwhelmed: the contour melts */
-        if(waste && recent_n>0){ float sp=SPEAK_RATE*(1.0f+fabsf(mo.S));   /* urge rises with arousal; needs a self to speak from */
-            if((frand()+1.0f)*0.5f < sp) speak(waste,m,&mo,scar,recent,&recent_n,tick); }
-        if(energy > REPRO_THRESH && tick - last_repro > REPRO_COOLDOWN){  /* too full -> split */
-            if(reproduce(m,scar,seed,tick)) energy *= REPRO_SPLIT;        /* pay only for a real child */
+        if(homeo_on){ mo.dissonance *= DISS_DECAY; mo.S -= S_RELAX*mo.S; }
+        if(fabsf(mo.S) >= S_DEATH){ contour_died=1; break; }
+        if(recent_n>0){                                   /* the field's confidence about what follows */
+            float coh=field_coherence(recent[recent_n-1]);
+            g_coh_floor = 0.99f*g_coh_floor + 0.01f*coh;   /* Stanley: a drifting silence-gate */
+            if(waste||ether){ float sp=SPEAK_RATE*(1.0f+fabsf(mo.S));
+                if(coh>0.05f && coh>=g_coh_floor && (frand()+1.0f)*0.5f < sp)
+                    speak(waste,ether,label,m,&mo,scar,recent,&recent_n,tick); }  /* voice -> waste + colony */
+        }
+        if(energy > REPRO_THRESH && tick - last_repro > REPRO_COOLDOWN){
+            if(reproduce(m,scar,seed,tick)){
+                energy *= REPRO_SPLIT;
+                if(ether){ FILE* b=fopen("lifeis/births.txt","a"); if(b){ fprintf(b,"%lu\n",hash_seed(seed,tick)); fclose(b);} } /* ask the colony for a slot */
+            }
             last_repro=tick;
         }
         if(tick<=30 || tick%100==0)
-            printf("  t%-6ld E%+.5f  S%+.3f  diss%+.3f  scar%.3f  y %.2e  %s\n",
-                   tick,energy,(double)mo.S,(double)mo.dissonance,(double)scar_total,yield,
-                   (dreaming?"DREAM":(diet_mode?"diet":(fed?"eat":"STARVE"))));
+            printf("%s  t%-6ld E%+.5f  S%+.3f  diss%+.3f  scar%.3f  y %.2e  %s\n",
+                   tag,tick,energy,(double)mo.S,(double)mo.dissonance,(double)scar_total,yield,
+                   (grazing?"GRAZE":(dreaming?"DREAM":(diet_mode?"diet":(fed?"eat":"STARVE")))));
     }
     if(!contour_died && energy>0.0f)
-        printf("\n  STILL ALIVE at tick %ld (cap) — immortality hole, investigate.\n",tick);
+        printf("%s\n  STILL ALIVE at tick %ld (cap) — immortality hole, investigate.\n",tag,tick);
     else
-        printf("\n  died at tick %ld (%s) — S%+.3f diss%+.3f scar%.3f emerged%d children%d.  да будет так.\n",
-               tick, contour_died?"contour collapse":"ran out of time",
-               (double)mo.S,(double)mo.dissonance,(double)scar_total,g_n_emerged,g_n_children);
-    for(int e=0;e<g_n_emerged && e<8;e++)
-        printf("    born in dream: %s + %s\n", glyph_name(g_emerged_a[e]), glyph_name(g_emerged_b[e]));
+        printf("%s  died at tick %ld (%s) — S%+.3f diss%+.3f scar%.3f emerged%d children%d graze%ld dream%ld.  да будет так.\n",
+               tag,tick, contour_died?"contour collapse":"ran out of time",
+               (double)mo.S,(double)mo.dissonance,(double)scar_total,g_n_emerged,g_n_children,n_graze,n_dream);
     if(food) fclose(food);
     if(waste) fclose(waste);
+    if(ether) fclose(ether);
     free(m);
     return 0;
+}
+
+/* split a corpus into `parts` contiguous slices: lifeis/slice_i.txt — each cell of
+ * the chorus wakes on a different region of the same world (Oleg's "different
+ * corpora OF ONE corpus": one voice ate the Arctic frame, one the making). */
+static int corpus_slice(const char* path, int parts){
+    FILE* f=fopen(path,"r"); if(!f) return 0;
+    long nl=0; int c; while((c=fgetc(f))!=EOF) if(c=='\n') nl++;
+    if(nl<parts) nl=parts;
+    long per=nl/parts + 1;
+    rewind(f);
+    char line[4096];
+    for(int p=0;p<parts;p++){
+        char sp[256]; snprintf(sp,sizeof sp,"lifeis/slice_%d.txt",p);
+        FILE* o=fopen(sp,"w"); if(!o){ fclose(f); return 0; }
+        for(long k=0;k<per && fgets(line,sizeof line,f);k++) fputs(line,o);
+        fclose(o);
+    }
+    fclose(f);
+    return 1;
+}
+
+/* fork one cell of the chorus. corpus=slice for the birth cohort, or NULL for a
+ * cell born into the ether (later generations feed on the colony's own voice). */
+static pid_t spawn_cell(const char* corpus, int label, unsigned long cseed){
+    fflush(stdout);                                /* empty inherited buffer before fork */
+    pid_t p=fork();
+    if(p==0){
+        char waste[256]; snprintf(waste,sizeof waste,"lifeis/waste_%d.log",label);
+        int rc=live(corpus, waste, "lifeis/ether.txt", NULL, cseed, label);
+        fflush(stdout); _exit(rc);                 /* _exit skips stdio flush — do it by hand */
+    }
+    if(p<0) perror("fork");
+    return p;
+}
+
+int main(int argc, char** argv){
+    /* interactive mouth: ./l --mouth [seed] */
+    if(argc>1 && strcmp(argv[1],"--mouth")==0){
+        unsigned long seed = argc>2 ? strtoul(argv[2],NULL,10) : 42UL;
+        seed_rng(seed); mouth_build(); charges_init();
+        Model* m=model_new(); run_mouth(m,seed); free(m); return 0;
+    }
+    mouth_build();          /* build the orthographic router before ANY fork or bite */
+    charges_init();
+    g_field_on=(getenv("NL_NOFIELD")==NULL);   /* A/B toggle: NL_NOFIELD=1 lifts the coherence field */
+
+    /* CHORUS: ./l chorus [cohort] [seed] — a colony of forked cells, each a distinct
+     * body on a slice of the world. fork gives every cell its own field / scars /
+     * symbols. molequla ecology + caveLLMan colony lineage, kept to one file. */
+    if(argc>1 && strcmp(argv[1],"chorus")==0){
+        int cohort = argc>2 ? atoi(argv[2]) : CHORUS_COHORT;
+        if(cohort<1) cohort=1; if(cohort>MAX_CELLS) cohort=MAX_CELLS;
+        unsigned long seed = argc>3 ? strtoul(argv[3],NULL,10) : 42UL;
+        mkdir("lifeis",0755);
+        if(!corpus_slice("lifeis/world.txt", cohort)){ printf("  no world to slice (lifeis/world.txt). да будет так.\n"); return 1; }
+        { FILE* e=fopen("lifeis/ether.txt","w"); if(e) fclose(e); }   /* fresh ether — last run's voices don't haunt this one */
+        { FILE* b=fopen("lifeis/births.txt","w"); if(b) fclose(b); }   /* fresh birth queue */
+        printf("nanolife CHORUS — %d cells wake on %d slices; the colony may grow to %d, and dies when all fall silent. seed=%lu\n\n",
+               cohort, cohort, MAX_CELLS, seed);
+        int live_n=0, next_label=0, peak=0; long births_consumed=0;
+        for(int i=0;i<cohort;i++){                  /* the birth cohort — each on a slice of the world */
+            char sl[256]; snprintf(sl,sizeof sl,"lifeis/slice_%d.txt",i);
+            if(spawn_cell(sl, next_label, seed+i)>0){ next_label++; live_n++; }
+        }
+        if(live_n>peak) peak=live_n;
+        while(live_n>0){                            /* THE GOVERNOR — population breathes 0..MAX_CELLS */
+            int st; pid_t d=waitpid(-1,&st,WNOHANG);
+            if(d>0){ live_n--; printf("[governor] a cell fell silent — %d alive\n", live_n); fflush(stdout); }
+            long avail=0; { FILE* b=fopen("lifeis/births.txt","r"); if(b){ int c; while((c=fgetc(b))!=EOF) if(c=='\n') avail++; fclose(b);} }
+            while(births_consumed<avail && live_n<MAX_CELLS && next_label<64){  /* a divide fills a slot */
+                unsigned long cseed = seed + 7919UL*(unsigned long)(next_label+1);
+                if(spawn_cell(NULL, next_label, cseed)>0){
+                    printf("[governor] a cell is born into the chorus (cell %d) — %d alive\n", next_label, live_n+1); fflush(stdout);
+                    next_label++; live_n++; if(live_n>peak) peak=live_n;
+                }
+                births_consumed++;
+            }
+            if(d<=0) usleep(20000);                 /* 20ms — don't spin the governor */
+        }
+        printf("\nnanolife CHORUS — the colony fell silent. %d cells lived, peak %d alive at once. да будет так.\n", next_label, peak);
+        return 0;
+    }
+
+    /* solo: the single mortal clock — ./l [seed] [diet] */
+    unsigned long seed = argc>1 ? strtoul(argv[1],NULL,10) : 42UL;
+    const char* diet = argc>2 ? argv[2] : NULL;
+    { int t[CTX]; int bn=semtok_line("the sun is fire and i feel fear in the dark",t,CTX);
+      if(bn<1){ t[0]=BOS_ID; bn=1; }
+      printf("  first breath:"); for(int i=0;i<bn;i++) printf(" %s",glyph_name(t[i])); printf("\n\n"); }
+    return live("lifeis/world.txt", "lifeis/waste.log", NULL, diet, seed, -1);
 }
