@@ -103,12 +103,12 @@ Two demands drove Phase B:
     **4 → 8 (cap) → turnover → 0**; a full run: 64 cells lived, peak 8, colony
     mortal ("fell silent"), ~44s wall. Solo unaffected. `N` is a carrying
     capacity, not a roster — zero contradiction with death.
-  - **Known endgame degeneracy (tuning, Phase 4):** the LAST ether-born cell,
-    born into a near-dead colony, grazes the newest not-own line — which stops
-    updating when almost no one speaks — and collapses into a 2-cycle
-    (`think make think make`). Poignant (the last voice alone) but a real wart.
-    Fix: `ether_graze` should eat a RANDOM recent not-own line, not always the
-    newest, so a lone cell draws variety from the ether's history.
+  - **Endgame degeneracy — FIXED.** The last ether-born cell used to chew the
+    one frozen newest not-own line and collapse into a 2-cycle (`think make`).
+    `ether_graze` now keeps the last 8 not-own voices and picks one at random
+    (seeded), so a lone dying cell draws variety from the chorus's history. The
+    endgame speaks full sentences again (`body longing light earth remember`,
+    `now write and see child`). Colony still terminates, mortality intact.
 
 **Phase 3 (chorus) = COMPLETE.** The base stands: a living, resonating, mortal
 ecology in one `l.c` — eats anything, speaks coherently without training, and
