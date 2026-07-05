@@ -705,7 +705,7 @@ static int ether_graze(const char* path, int own_label, int* out, int max){
 static void speak(FILE* w, FILE* ether, int label, Model* m, const Modes* mo, const float* scar, int* recent, int* recent_n, long tick){
     if(!w && !ether) return;
     static float sl[VOCAB_CAP];
-    char utt[256]; int up=0; utt[0]='\0';
+    char utt[256]; int up=0;
     if(w) fprintf(w, "t%-6ld", tick);
     for(int k=0;k<SPEAK_LEN;k++){
         int prev = (*recent_n>0) ? recent[*recent_n-1] : -1;
