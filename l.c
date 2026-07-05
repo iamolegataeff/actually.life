@@ -765,14 +765,14 @@ static unsigned long hash_seed(unsigned long s, long tick){
     s *= 6364136223846793005UL; s ^= s>>29; s *= 0xBF58476D1CE4E5B9UL; s ^= s>>32;
     return s ? s : 1;
 }
-static int reproduce(const Model* m, const float* scar, unsigned long pseed, long tick){
+static int reproduce(const Model* m, const float* scar, unsigned long pseed, long tick, char* outpath){
     if(g_n_children >= MAX_CHILDREN) return 0;
     mkdir("lifeis", 0755); mkdir("lifeis/children", 0755);
-    char path[256]; snprintf(path,sizeof path,"lifeis/children/child_%d.nl", g_n_children);
+    char path[256]; snprintf(path,sizeof path,"lifeis/children/c_%lu_%d.nl", pseed, g_n_children); /* unique per cell */
     FILE* f=fopen(path,"wb"); if(!f) return 0;
     unsigned long cseed = hash_seed(pseed, tick);
     int ok = 1;
-    ok &= (fwrite("NLC1",1,4,f)==4);
+    ok &= (fwrite("NLC2",1,4,f)==4);
     ok &= (fwrite(&cseed,sizeof cseed,1,f)==1);
     ok &= (fwrite(&tick,sizeof tick,1,f)==1);
     ok &= (fwrite(&g_n_emerged,sizeof(int),1,f)==1);
@@ -780,10 +780,36 @@ static int reproduce(const Model* m, const float* scar, unsigned long pseed, lon
     if(g_n_emerged>0){ ok &= (fwrite(g_emerged_a,sizeof(int),(size_t)g_n_emerged,f)==(size_t)g_n_emerged);
                        ok &= (fwrite(g_emerged_b,sizeof(int),(size_t)g_n_emerged,f)==(size_t)g_n_emerged); }
     ok &= (fwrite(m,sizeof(Model),1,f)==1);                              /* warm-start genome */
+    ok &= (fwrite(g_field_bi,sizeof(float),(size_t)VOCAB_CAP*VOCAB_CAP,f)==(size_t)VOCAB_CAP*VOCAB_CAP); /* inherit the coherence field */
+    ok &= (fwrite(g_field_row,sizeof(float),VOCAB_CAP,f)==(size_t)VOCAB_CAP);
     ok &= (fclose(f)==0);
     if(!ok) return 0;                                                    /* a truncated child is not born */
+    if(outpath){ strncpy(outpath,path,255); outpath[255]='\0'; }
     g_n_children++;
     return 1;
+}
+
+/* load a warm-start genome written by reproduce() — the child inherits the parent's
+ * body (weights + Hebbian adapters), its COHERENCE FIELD, its wounds, and its invented
+ * symbols. returns the child's derived seed (its own dice), 0 on failure. this is what
+ * makes chorus reproduction HERITABLE: coherent parents beget coherent children, so
+ * idea-3 selection stops being momentary and becomes real evolution over generations. */
+static unsigned long load_genome(const char* path, Model* m, float* scar){
+    FILE* f=fopen(path,"rb"); if(!f) return 0;
+    char magic[4]; unsigned long cseed=0; long tick; int ok=1;
+    ok &= (fread(magic,1,4,f)==4) && memcmp(magic,"NLC2",4)==0;
+    ok &= (fread(&cseed,sizeof cseed,1,f)==1);
+    ok &= (fread(&tick,sizeof tick,1,f)==1);
+    ok &= (fread(&g_n_emerged,sizeof(int),1,f)==1);
+    if(!ok || g_n_emerged<0 || g_n_emerged>MAX_EMERGED){ fclose(f); return 0; }
+    ok &= (fread(scar,sizeof(float),VOCAB_CAP,f)==(size_t)VOCAB_CAP);
+    if(g_n_emerged>0){ ok &= (fread(g_emerged_a,sizeof(int),(size_t)g_n_emerged,f)==(size_t)g_n_emerged);
+                       ok &= (fread(g_emerged_b,sizeof(int),(size_t)g_n_emerged,f)==(size_t)g_n_emerged); }
+    ok &= (fread(m,sizeof(Model),1,f)==1);
+    ok &= (fread(g_field_bi,sizeof(float),(size_t)VOCAB_CAP*VOCAB_CAP,f)==(size_t)VOCAB_CAP*VOCAB_CAP);
+    ok &= (fread(g_field_row,sizeof(float),VOCAB_CAP,f)==(size_t)VOCAB_CAP);
+    fclose(f);
+    return ok ? (cseed?cseed:1) : 0;
 }
 
 /* ── Phase A step 10: the mouth — the organism talks WITH you (the resonance loop) ──
@@ -833,7 +859,7 @@ static void run_mouth(Model* m, unsigned long seed){
  * its food, waste its voice, seed its body AND its dice, label>=0 tags its prints
  * when the colony forks (stdout interleaves). every per-cell global (field, scars,
  * cooc, emerged symbols) is per-PROCESS — so fork gives each cell its own for free. */
-static int live(const char* corpus, const char* waste_path, const char* ether_path, const char* diet, unsigned long seed, int label){
+static int live(const char* genome, const char* corpus, const char* waste_path, const char* ether_path, const char* diet, unsigned long seed, int label){
     char tag[24]; if(label>=0) snprintf(tag,sizeof tag,"[cell %d] ",label); else tag[0]='\0';
     seed_rng(seed);
     Model* m=model_new();                          /* own seed -> own random body */
@@ -854,6 +880,8 @@ static int live(const char* corpus, const char* waste_path, const char* ether_pa
 
     Modes mo = {0.0f, 0.0f};
     static float scar[VOCAB_CAP]; for(int i=0;i<VOCAB_CAP;i++) scar[i]=0.0f; /* permanent wounds (never decay) */
+    if(genome){ unsigned long cs=load_genome(genome, m, scar);   /* HEREDITY: warm-start from a parent */
+                if(cs){ seed_rng(cs); printf("%s  born of a parent — inherits its field, wounds, symbols.\n", tag); } }
     int   scar_on = (getenv("NL_NOSCAR")==NULL);
     int   dream_on = (getenv("NL_NODREAM")==NULL);
     float scar_total=0.0f;
@@ -913,9 +941,10 @@ static int live(const char* corpus, const char* waste_path, const char* ether_pa
                     { float uc=speak(waste,ether,label,m,&mo,scar,recent,&recent_n,tick); energy -= SPEAK_COST*(float)SPEAK_LEN*(1.0f-uc); } }  /* voice -> waste + colony */
         }
         if(energy > REPRO_THRESH && tick - last_repro > REPRO_COOLDOWN){
-            if(reproduce(m,scar,seed,tick)){
+            char cpath[256]; cpath[0]='\0';
+            if(reproduce(m,scar,seed,tick,cpath)){
                 energy *= REPRO_SPLIT;
-                if(ether){ FILE* b=fopen("lifeis/births.txt","a"); if(b){ fprintf(b,"%lu\n",hash_seed(seed,tick)); fclose(b);} } /* ask the colony for a slot */
+                if(ether){ FILE* b=fopen("lifeis/births.txt","a"); if(b){ fprintf(b,"%s\n",cpath); fclose(b);} } /* the child's genome awaits a slot */
             }
             last_repro=tick;
         }
@@ -960,12 +989,12 @@ static int corpus_slice(const char* path, int parts){
 
 /* fork one cell of the chorus. corpus=slice for the birth cohort, or NULL for a
  * cell born into the ether (later generations feed on the colony's own voice). */
-static pid_t spawn_cell(const char* corpus, int label, unsigned long cseed){
+static pid_t spawn_cell(const char* genome, const char* corpus, int label, unsigned long cseed){
     fflush(stdout);                                /* empty inherited buffer before fork */
     pid_t p=fork();
     if(p==0){
         char waste[256]; snprintf(waste,sizeof waste,"lifeis/waste_%d.log",label);
-        int rc=live(corpus, waste, "lifeis/ether.txt", NULL, cseed, label);
+        int rc=live(genome, corpus, waste, "lifeis/ether.txt", NULL, cseed, label);
         fflush(stdout); _exit(rc);                 /* _exit skips stdio flush — do it by hand */
     }
     if(p<0) perror("fork");
@@ -999,7 +1028,7 @@ int main(int argc, char** argv){
         int live_n=0, next_label=0, peak=0; long births_consumed=0;
         for(int i=0;i<cohort;i++){                  /* the birth cohort — each on a slice of the world */
             char sl[256]; snprintf(sl,sizeof sl,"lifeis/slice_%d.txt",i);
-            if(spawn_cell(sl, next_label, seed+i)>0){ next_label++; live_n++; }
+            if(spawn_cell(NULL, sl, next_label, seed+i)>0){ next_label++; live_n++; }  /* cohort: no parent, a slice of the world */
         }
         if(live_n>peak) peak=live_n;
         while(live_n>0){                            /* THE GOVERNOR — population breathes 0..MAX_CELLS */
@@ -1007,9 +1036,13 @@ int main(int argc, char** argv){
             if(d>0){ live_n--; printf("[governor] a cell fell silent — %d alive\n", live_n); fflush(stdout); }
             long avail=0; { FILE* b=fopen("lifeis/births.txt","r"); if(b){ int c; while((c=fgetc(b))!=EOF) if(c=='\n') avail++; fclose(b);} }
             while(births_consumed<avail && live_n<MAX_CELLS && next_label<MAX_LIFETIME_CELLS){  /* a divide fills a slot */
+                char gpath[256]; gpath[0]='\0';       /* the genome the reproducing cell left for its child */
+                { FILE* b=fopen("lifeis/births.txt","r"); if(b){ char ln[256]; long i=0;
+                    while(fgets(ln,sizeof ln,b)){ if(i==births_consumed){ ln[strcspn(ln,"\n")]='\0'; strncpy(gpath,ln,255); gpath[255]='\0'; break; } i++; }
+                    fclose(b); } }
                 unsigned long cseed = seed + 7919UL*(unsigned long)(next_label+1);
-                if(spawn_cell(NULL, next_label, cseed)>0){
-                    printf("[governor] a cell is born into the chorus (cell %d) — %d alive\n", next_label, live_n+1); fflush(stdout);
+                if(spawn_cell(gpath[0]?gpath:NULL, NULL, next_label, cseed)>0){   /* HEREDITY: born OF a parent's genome */
+                    printf("[governor] a cell is born of a parent (cell %d) — %d alive\n", next_label, live_n+1); fflush(stdout);
                     next_label++; live_n++; if(live_n>peak) peak=live_n;
                 }
                 births_consumed++;
@@ -1026,5 +1059,5 @@ int main(int argc, char** argv){
     { int t[CTX]; int bn=semtok_line("the sun is fire and i feel fear in the dark",t,CTX);
       if(bn<1){ t[0]=BOS_ID; bn=1; }
       printf("  first breath:"); for(int i=0;i<bn;i++) printf(" %s",glyph_name(t[i])); printf("\n\n"); }
-    return live("lifeis/world.txt", "lifeis/waste.log", NULL, diet, seed, -1);
+    return live(NULL, "lifeis/world.txt", "lifeis/waste.log", NULL, diet, seed, -1);
 }
