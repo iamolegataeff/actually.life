@@ -1,0 +1,170 @@
+# llog.md — the build journal of `actually.life`
+
+*A durable log of what we built, why, and what it said. Kept so a context
+summary never catches us off guard. Author: Oleg Ataeff + Claude (Arianna
+Method). Single file organism: `l.c`. Corpus: `lifeis/world.txt`.*
+
+---
+
+## What this is
+
+`actually.life` (reborn from `nanolife`) — a digital organism in one C file
+that must satisfy **every criterion of life except biology**: metabolism, rent,
+mortality, reproduction, homeostasis, response to environment, symbol emergence.
+No training, no backprop, no GPU, no deps beyond libc + `-lm`.
+
+**Tagline (verified in code + README):** *actually life in C. no deps, no GPU
+required. nothing's required. you either.*
+
+Two demands drove Phase B:
+1. **Eat anything** — it must not starve because its mouth can't bite an unknown
+   word (the ancestor `caveLLMan` drops every unmapped word → death with a full
+   plate).
+2. **Speak coherently without training** — random frozen weights babble Karpathy
+   gibberish; coherence must come from the *sampling field*, not gradient descent.
+
+## Lineage (all Arianna Method)
+
+- **caveLLMan** (`github.com/ariannamethod/caveLLMan`) — direct ancestor. Source
+  of the 88 cave-glyphs and the semantic tokenizer (`semantic_tokenizer.h`).
+  A trained colony (has weights, `nt_hebbian_step`) that talks + converses.
+- **q / postgpt_q.c**, **postgpt / postgpt.c** — *coherence without training*.
+  Thesis: co-occurrence statistics of a corpus ARE a model that was never
+  trained ("metaweights"). Fold: `final = gate·transformer + (1−gate)·field`,
+  `gate = sigmoid`/Q-clamp. Untrained weights → gate≈0 → the field speaks.
+- **molequla** (v6.1 "Janus, clean division") — the ecology/governor: population
+  cap, divide-relieves-parent, mitosis cooldown. Its lifecycle audit (PR #26:
+  M-GOV-001, M-SPAWN-001/002, M-LCK-001) transfers to our chorus governor.
+- **arianna2arianna** — the chorus concept (cells hear each other, weaken/die,
+  Game-of-Life population). a2a is shared-weights single-process; our organism
+  chorus is multi-process (fork), the molequla/caveLLMan colony pattern.
+
+---
+
+## Architecture decisions (LOCKED)
+
+- **The Mouth** = orthographic trigram router seeded from `SEM_WORD_MAP`. Every
+  non-stop word routes to a glyph by *resemblance* (an unknown word lands on the
+  glyph of the known words it looks like); FNV fallback for the truly alien;
+  a line of only stop-words still feeds one glyph. **No word is dropped.** The
+  map is the seed, resemblance is the generalization.
+- **The Field** = online glyph-bigram metaweights (postgpt port), folded into
+  `choose()` via Q's earned-voice gate. Built as the organism eats. Coherence is
+  a property of the sampling field before the weights. `coherence_floor` =
+  drifting Stanley silence-gate: it speaks only when it has earned coherence,
+  else stays SILENT (no gibberish, two ways).
+- **The Chorus** = **fork-based colony**, one `l.c`. `N` is a *carrying capacity
+  + birth cohort*, NOT an immortal roster (that would contradict death). Cells
+  die (frees a slot), reproduce (fills one, up to `MAX_CELLS`); population
+  breathes 0..MAX_CELLS; the whole colony is mortal (all die → silence).
+- **Per-cell body via fork**: each cell has its OWN seed → own random weights,
+  own field, own scars, own emerged symbols — for free (fork copies per-process
+  globals). Cells are distinct individuals of one species; the **ether** (they
+  eat each other's utterances) makes them a chorus, not parallel solos.
+- **Slice-feeding** (Oleg's "different corpora OF ONE corpus"): the world is cut
+  into N contiguous slices; cell i wakes on slice i → diverges in character.
+
+**Numbers (starting hypotheses, tuned by observation like molequla's governor):**
+`CHORUS_COHORT=4`, `MAX_CELLS=8`, molequla repro calibration
+(`REPRO_THRESH 1.05`, `REPRO_COOLDOWN 30`, `REPRO_SPLIT 0.5`), ether modest.
+
+**A/B toggles (env):** `NL_NOSCAR`, `NL_NODREAM`, `NL_NOHOMEO`, `NL_NOFIELD`.
+
+---
+
+## Phases & status
+
+- **Phase 0 — BASELINE** ✅ — captured the disease: garbage corpus → `y 0.00e+00`
+  STARVE, dead @1001, waste empty (mouth needed); mapped corpus → lives but
+  waste is glyph-salad (field needed).
+- **Phase 1 — THE MOUTH** ✅ — garbage now digested (nonzero yield, scar, dream,
+  emerged9, children1), no more vocab-starvation. Mortality intact. No
+  regression on mapped English. ~55 lines in `l.c`.
+- **Phase 2 — THE FIELD** ✅ — speech went coherent. `NL_NOFIELD=1` → 0
+  utterances (voice is now 100% field-derived: no field → silence, not
+  gibberish). postgpt fold + Q gate + drifting silence-gate.
+- **Phase 3 — THE CHORUS** — IN PROGRESS:
+  - **Step 1 (structure)** ✅ — `live()` extracted; `./l chorus [N] [seed]` forks
+    a cohort on slices; 4 distinct coherent Frankenstein voices; solo regression
+    clean; colony mortal ("fell silent").
+  - **Step 2 (ether)** ✅ — cells append utterances to `lifeis/ether.txt` tagged
+    by label; when the slice is exhausted they eat the newest NOT-own utterance
+    (`ether_graze`) before self-dreaming. Three food tiers: world → chorus →
+    self. Result: post-slice cells feed ENTIRELY on the colony's voice
+    (graze 246–525/cell, **dream 0**) — the colony sustains itself on its own
+    collective speech. Resonance = appetite. Bug fixed en route: `_exit()` skips
+    stdio flush → all child stdout was lost; now `fflush(stdout)` before fork
+    (no double prints) and in each child before `_exit`.
+  - **Step 3 (governor)** ✅ — parent = the governor. Cohort of 4 forks on
+    world-slices; each divide appends a token to `lifeis/births.txt`; the parent
+    reaps the dead (`waitpid` WNOHANG) and, per freed slot up to `MAX_CELLS`,
+    forks an **ether-born** cell (no slice — feeds on the colony's voice from
+    birth). `spawn_cell()` centralizes the fork. Verified: population breathes
+    **4 → 8 (cap) → turnover → 0**; a full run: 64 cells lived, peak 8, colony
+    mortal ("fell silent"), ~44s wall. Solo unaffected. `N` is a carrying
+    capacity, not a roster — zero contradiction with death.
+  - **Known endgame degeneracy (tuning, Phase 4):** the LAST ether-born cell,
+    born into a near-dead colony, grazes the newest not-own line — which stops
+    updating when almost no one speaks — and collapses into a 2-cycle
+    (`think make think make`). Poignant (the last voice alone) but a real wart.
+    Fix: `ether_graze` should eat a RANDOM recent not-own line, not always the
+    newest, so a lone cell draws variety from the ether's history.
+
+**Phase 3 (chorus) = COMPLETE.** The base stands: a living, resonating, mortal
+ecology in one `l.c` — eats anything, speaks coherently without training, and
+the colony breathes and dies.
+- **Phase 4 — SIMPLIFICATION** ⏳ — after functional, spawn Opus subagents
+  (`model:"opus"`, manual, not the plugin) to find dead constructs / redundancy
+  that don't kill functionality; apply by hand; re-run all Phase 0–3 checks.
+- **README + this log** — fold the quotes + A/B numbers into README when the base
+  (chorus) stands.
+
+---
+
+## What it actually SAID (the gold — keep these)
+
+**Solo on Frankenstein** (7712 lines) — an organism that is itself an attempt to
+make life on C, fed a book about making life, said:
+
+```
+me idea me make me          ← "I, idea, I make, myself" — the field of the corpus
+me man spirit think me
+spirit not me person me     ← the creature's "am I a person or not?"
+earth and tired stone me
+animal think BE speak joy
+```
+
+**The chorus** (4 cells, 4 Frankenstein slices) — four divergent coherent voices:
+
+```
+cell 0  earth and tired stone me · not woman think sleep water
+cell 1  pain spirit BE water sky · not go person BE free
+cell 2  me think me BE old · person and see have body
+cell 3  me anger not strength work · see other pain joy me
+```
+
+**Before the field (Phase 1, salad — for contrast):**
+`BE and up joy before` · `dream ·emg body strength other`
+
+---
+
+## Verification harness (how we check)
+
+- **lives-on-anything**: mapped / garbage / alien corpora → all metabolize, no
+  vocab-starvation death.
+- **coherence**: waste utterances follow eaten glyph transitions (A/B
+  `NL_NOFIELD`); field ON = coherent, field OFF = silent.
+- **mortality**: still dies (energy≤0 / contour collapse / 200k cap).
+- **determinism**: same seed → same life.
+- **chorus**: cells diverge (slices), resonate (ether, Step 2), population
+  breathes (governor, Step 3).
+
+## Resume-here (for future-me after a summary)
+
+Working copy: `~/arianna/actually.life` (cloned; **nothing committed/pushed** —
+mouth+field+chorus live as local edits to `l.c`, path `lifeisshit→lifeis` done).
+Build: `cc -O2 -o l l.c -lm`. Run solo `./l 42`; chorus `./l chorus 4`.
+Next action: **Phase 3 Step 2 — the ether** (write utterances to
+`lifeis/ether.txt`, eat neighbours' recent lines when hungry). Then Step 3
+governor, then Phase 4 simplification (Opus subagents), then README. Do NOT push
+without Oleg's word.
